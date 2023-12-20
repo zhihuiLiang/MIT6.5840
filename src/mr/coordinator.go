@@ -5,7 +5,7 @@ import (
 	"net"
 	"net/http"
 	"net/rpc"
-	"os"
+	"sync"
 	"sync/atomic"
 )
 
@@ -16,28 +16,58 @@ const (
 
 type Coordinator struct {
 	// Your definitions here.
-	ReduceNum   int32
-	MapTaskID   int32
-	MapTaskChan chan string
+	ReduceNum        int32
+	lock             sync.Mutex
+	MapTaskID        int32
+	ReduceTaskID     int32
+	FinishMapTaskNum int32
+	MaxMapTaskID     int32
+	MapTaskChan      chan string
 }
 
 // Your code here -- RPC handlers for the worker to call.
 
-func (c *Coordinator) TaskRequest(args *TaskRequestArgs, reply *TaskRequestReply) error {
-	if args.TaskType == RequestMap {
-		reply.Filename = <-c.MapTaskChan
-		reply.WorkerID = c.MapTaskID
+func (c *Coordinator) MapTaskRequest(args *MapTaskRequestArgs, reply *MapTaskRequestReply) error {
+	filename, ok := <-c.MapTaskChan
+	if ok {
+		reply.HasMapTask = true
+		reply.Filename = filename
+		c.lock.Lock()
+		reply.MapTaskID = c.MapTaskID
+		c.MapTaskID += 1
+		c.lock.Unlock()
 		reply.ReduceNum = c.ReduceNum
-		atomic.AddInt32(&c.MapTaskID, 1)
+	} else {
+		reply.HasMapTask = false
+	}
+
+	return nil
+}
+
+func (c *Coordinator) MapDoneRequest(args *MapDoneTaskRequestArgs, reply *MapDoneTaskRequestReply) error {
+	atomic.AddInt32(&c.FinishMapTaskNum, 1)
+	return nil
+}
+
+func (c *Coordinator) GoReduceRequest(args *GoReduceRequestArgs, reply *GoReduceRequestReply) error {
+	if atomic.LoadInt32(&c.FinishMapTaskNum) == c.MaxMapTaskID {
+		reply.Ok = true
+	} else {
+		reply.Ok = false
 	}
 	return nil
 }
 
-// an example RPC handler.
-//
-// the RPC argument and reply types are defined in rpc.go.
-func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
-	reply.Y = args.X + 1
+func (c *Coordinator) ReduceTaskRequest(arg *ReduceTaskRequestArgs, reply *ReduceTaskRequestReply) error {
+	c.lock.Lock()
+	id := c.ReduceTaskID
+	if id >= c.ReduceNum {
+		return nil
+	}
+	reply.ReduceTaskID = id
+	c.ReduceTaskID += 1
+	c.lock.Unlock()
+	reply.MaxMapTaskID = c.MapTaskID
 	return nil
 }
 
@@ -45,10 +75,10 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 func (c *Coordinator) server() {
 	rpc.Register(c)
 	rpc.HandleHTTP()
-	//l, e := net.Listen("tcp", ":1234")
-	sockname := coordinatorSock()
-	os.Remove(sockname)
-	l, e := net.Listen("unix", sockname)
+	l, e := net.Listen("tcp", ":1234")
+	// sockname := coordinatorSock()
+	// os.Remove(sockname)
+	// l, e := net.Listen("unix", sockname)
 	if e != nil {
 		log.Fatal("listen error:", e)
 	}
@@ -72,11 +102,14 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{}
 	// Your code here.
 	c.ReduceNum = int32(nReduce)
-	c.MapTaskID = 1
+	c.MapTaskID = 0
+	c.MapTaskChan = make(chan string, 100)
 	for _, filename := range files {
 		c.MapTaskChan <- filename
 	}
-
+	close(c.MapTaskChan)
+	c.ReduceTaskID = 0
+	c.MaxMapTaskID = int32(len(files))
 	c.server()
 	return &c
 }

@@ -1,12 +1,14 @@
 package mr
 
 import (
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"io"
 	"log"
 	"net/rpc"
 	"os"
+	"sort"
 )
 
 type ByKey []KeyValue
@@ -47,15 +49,39 @@ func Worker(mapf func(string, string) []KeyValue,
 	for !hasFinish {
 		switch taskState {
 		case MapTaskState:
-			args := TaskRequestArgs{RequestMap}
-			reply := TaskRequestReply{}
-			ok := call("Coordinator.TaskRequest", &args, &reply)
+			args := MapTaskRequestArgs{}
+			reply := MapTaskRequestReply{}
+			ok := call("Coordinator.MapTaskRequest", &args, &reply)
 			if !ok {
 				log.Fatalf("Call Rpc TaskRequest Failed!")
 			}
-			DoMapTask(mapf, reply.Filename, reply.WorkerID, reply.ReduceNum)
+			if reply.HasMapTask {
+				DoMapTask(mapf, reply.Filename, reply.MapTaskID, reply.ReduceNum)
+				ok := call("Coordinator.MapDoneRequest", &MapDoneTaskRequestArgs{}, &MapDoneTaskRequestReply{})
+				if !ok {
+					log.Fatalf("Call Rpc MapDoneRequest Failed!")
+				}
+			} else {
+				taskState = WaitTaskState
+			}
 		case WaitTaskState:
-
+			reply := GoReduceRequestReply{}
+			ok := call("Coordinator.GoReduceRequest", &GoReduceRequestArgs{}, &reply)
+			if !ok {
+				log.Fatalf("Call GoReduceRequest Failed!")
+			}
+			if reply.Ok {
+				taskState = ReduceTaskState
+			}
+		case ReduceTaskState:
+			args := ReduceTaskRequestArgs{}
+			reply := ReduceTaskRequestReply{}
+			ok := call("Coordinator.ReduceTaskRequest", &args, &reply)
+			if !ok {
+				log.Fatalf("Call Rpc TaskRequest Failed!")
+			}
+			DoReduceTask(reply.ReduceTaskID, reply.MaxMapTaskID, reducef)
+			hasFinish = true
 		}
 
 	}
@@ -65,7 +91,7 @@ func Worker(mapf func(string, string) []KeyValue,
 
 }
 
-func DoMapTask(mapf func(string, string) []KeyValue, filename string, workID int32, nReduce int32) {
+func DoMapTask(mapf func(string, string) []KeyValue, filename string, taskID int32, nReduce int32) {
 	file, err := os.Open(filename)
 	if err != nil {
 		log.Fatalf("cannot open %v", filename)
@@ -77,52 +103,80 @@ func DoMapTask(mapf func(string, string) []KeyValue, filename string, workID int
 	defer file.Close()
 
 	kva := mapf(filename, string(content))
+	hashKV := make([][]KeyValue, nReduce)
 	for _, kv := range kva {
 		index := ihash(kv.Key) % int(nReduce)
-		outputName := fmt.Sprintf("mr-tmp-%d-%d", workID, index)
+		hashKV[index] = append(hashKV[index], kv)
+	}
+	for i := 0; i < int(nReduce); i++ {
+		outputName := fmt.Sprintf("mr-tmp-%d-%d", taskID, i)
 		file, err := os.OpenFile(outputName, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0666)
 		if err != nil {
 			log.Fatalf("cannot open file %v", outputName)
 		}
-		file.WriteString(fmt.Sprintf("%v %v\n", kv.Key, kv.Value))
+		enc := json.NewEncoder(file)
+		for _, kv := range hashKV[i] {
+			enc.Encode(&kv)
+		}
 		file.Close()
 	}
 }
 
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-func CallExample() {
-
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
+func DoReduceTask(id int32, maxMapTaskID int32, reducef func(string, []string) string) {
+	var kva []KeyValue
+	for mapTaskID := 0; mapTaskID < int(maxMapTaskID); mapTaskID++ {
+		filename := fmt.Sprintf("mr-tmp-%d-%d", mapTaskID, id)
+		_, err := os.Lstat(filename)
+		if !os.IsNotExist(err) {
+			file, err := os.Open(filename)
+			if err != nil {
+				log.Fatalf("Open %s Failed! Err:%s", filename, err)
+			}
+			dec := json.NewDecoder(file)
+			for {
+				var kv KeyValue
+				if err := dec.Decode(&kv); err != nil {
+					break
+				}
+				kva = append(kva, kv)
+			}
+			file.Close()
+		}
 	}
+	sort.Sort(ByKey(kva))
+
+	oname := fmt.Sprintf("mr-out-%d", id)
+	ofile, _ := os.Create(oname)
+
+	i := 0
+	for i < len(kva) {
+		j := i + 1
+		for j < len(kva) && kva[j].Key == kva[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, kva[k].Value)
+		}
+		output := reducef(kva[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
+
+		i = j
+	}
+
+	ofile.Close()
+
 }
 
 // send an RPC request to the coordinator, wait for the response.
 // usually returns true.
 // returns false if something goes wrong.
 func call(rpcname string, args interface{}, reply interface{}) bool {
-	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
-	sockname := coordinatorSock()
-	c, err := rpc.DialHTTP("unix", sockname)
+	c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
+	// sockname := coordinatorSock()
+	// c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
 		log.Fatal("dialing:", err)
 	}
